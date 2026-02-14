@@ -1,0 +1,45 @@
+# ─── Hierarchical MDLM Training Configuration ──────────────────────────────
+
+# Model
+pretrained_path: "kuleshov-group/mdlm-owt"
+vocab_size: 50258          # GPT-2 (50257) + 1 mask token
+num_levels: 2              # K = number of hierarchy levels
+hidden_size: 768           # DDiT hidden dimension
+cond_dim: 128              # DDiT timestep conditioning dimension
+max_length: 1024           # maximum sequence length
+
+# Noise schedule
+noise_type: "loglinear"
+sampling_eps: 0.001
+antithetic_sampling: true
+
+# LoRA (applied in Phase 2)
+lora_rank: 8
+lora_alpha: 16.0
+lora_dropout: 0.05
+lora_target_modules:
+  - ".*\\.attn_qkv$"
+  - ".*\\.attn_out$"
+  - ".*\\.mlp\\.0$"
+  - ".*\\.mlp\\.2$"
+
+# Phase 1: Hierarchy embedding + output heads only
+phase1_lr: 1.0e-4
+phase1_weight_decay: 0.0
+phase1_max_steps: 10000
+phase1_batch_size: 16
+phase1_grad_clip: 1.0
+
+# Phase 2: LoRA fine-tuning of full model
+phase2_lr: 3.0e-5
+phase2_weight_decay: 0.01
+phase2_max_steps: 50000
+phase2_batch_size: 16
+phase2_grad_clip: 1.0
+
+# General
+device: "cuda"
+log_every: 100
+save_every: 5000
+save_dir: "checkpoints"
+seed: 42
