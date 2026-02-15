@@ -1,1 +1,2 @@
 from data.hierarchy_dataset import HierarchyDataset, HierarchyCollator
+from data.wikihow_dataset import WikiHowHierarchyDataset

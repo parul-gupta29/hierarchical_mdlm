@@ -156,23 +156,23 @@ class HierarchicalGenerator(nn.Module):
         x0: torch.Tensor,
         hierarchy_labels: torch.Tensor,
         title_mask: torch.Tensor,
-        dsigma: torch.Tensor,
-        sigma: torch.Tensor,
+        per_level_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the hierarchical MDLM training loss.
+        """Compute the hierarchical MDLM training loss with per-level weights.
 
-        For each masked non-title token i with GT level k_i the loss is the
-        continuous-time ELBO term:
-            -(dsigma / expm1(sigma)) * log p_{k_i}(x0_i | x_t, sigma)
+        Each hierarchy level has its own noise scale, producing a different
+        ELBO weight.  For each masked non-title token i with GT level k_i:
+
+            loss_i = -per_level_weight[b, k_i] * log p_{k_i}(x0_i | x_t, sigma)
 
         Args:
             logits_per_level: list of K tensors (B, L, V), raw logits.
             xt:               (B, L) noisy tokens.
             x0:               (B, L) clean tokens.
             hierarchy_labels: (B, L) integer level labels in {0, ..., K-1}.
-            title_mask:       (B, L) bool/float — 1 for title tokens (excluded from loss).
-            dsigma:           (B,) noise rate at sampled t.
-            sigma:            (B,) total noise at sampled t.
+            title_mask:       (B, L) bool/float — 1 for title tokens (excluded).
+            per_level_weight: (B, K) ELBO coefficient per level (from
+                              HierarchicalNoiseSchedule.get_per_level_loss_weight).
 
         Returns:
             Scalar loss (mean over valid tokens).
@@ -180,11 +180,10 @@ class HierarchicalGenerator(nn.Module):
         B, L = xt.shape
 
         # Positions that contribute to loss: masked AND not title
-        is_masked = (xt == self.mask_index).float()  # (B, L)
-        loss_mask = is_masked * (1.0 - title_mask.float())  # (B, L)
+        is_masked = (xt == self.mask_index).float()               # (B, L)
+        loss_mask = is_masked * (1.0 - title_mask.float())        # (B, L)
 
         # Apply subs parameterization per head and gather log-probs at x0
-        # Shape: (B, L, K)
         log_probs_at_x0 = torch.stack(
             [
                 torch.gather(
@@ -198,14 +197,17 @@ class HierarchicalGenerator(nn.Module):
         )  # (B, L, K)
 
         # Select the log-prob from the head matching the GT level
-        # hierarchy_labels: (B, L) -> (B, L, 1)
-        level_idx = hierarchy_labels.unsqueeze(-1).long()  # (B, L, 1)
+        level_idx = hierarchy_labels.unsqueeze(-1).long()         # (B, L, 1)
         log_p = torch.gather(log_probs_at_x0, dim=-1, index=level_idx).squeeze(-1)
         # log_p: (B, L)
 
-        # Weight by the continuous-time ELBO coefficient
-        weight = (dsigma / torch.expm1(sigma))  # (B,)
-        per_token_loss = -log_p * weight[:, None]  # (B, L)
+        # Per-token ELBO weight based on its level
+        # per_level_weight: (B, K) → gather per token
+        token_weight = torch.gather(
+            per_level_weight, dim=1, index=hierarchy_labels.long()
+        )  # (B, L)
+
+        per_token_loss = -log_p * token_weight                    # (B, L)
 
         # Mask and average
         per_token_loss = per_token_loss * loss_mask

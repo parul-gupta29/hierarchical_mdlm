@@ -97,12 +97,16 @@ def main():
     labels = torch.tensor([all_levels] * B, dtype=torch.long, device=device)
     hier_probs = HierarchyEmbedding.labels_to_onehot(labels, K).to(device)
 
-    # Noise schedule
+    # Noise schedule (with per-level scaling)
     noise = get_noise_schedule(config.noise_type)
 
     # Sample
     sampler = HierarchicalSampler(
-        model=model, noise=noise, num_steps=args.num_steps, device=device
+        model=model,
+        noise=noise,
+        level_scales=config.noise_level_scales,
+        num_steps=args.num_steps,
+        device=device,
     )
     generated = sampler.sample(title_tensor, hier_probs, seq_length=L)
 

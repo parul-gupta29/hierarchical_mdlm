@@ -12,6 +12,14 @@ max_length: 1024           # maximum sequence length
 noise_type: "loglinear"
 sampling_eps: 0.001
 antithetic_sampling: true
+# Per-level noise scales: level 0 (summary) = low noise, level 1 (text) = high noise
+noise_level_scales:
+  - 0.5     # summary — half the base noise
+  - 1.0     # text    — full base noise
+
+# Dataset
+dataset: "wikihow"              # "wikihow" or "json"
+wikihow_max_samples: null       # set to an int for debugging (e.g. 1000)
 
 # LoRA (applied in Phase 2)
 lora_rank: 8

@@ -11,12 +11,13 @@ Phase 2 — **Full LoRA fine-tuning**
     The original backbone weights remain frozen; only the low-rank residuals
     and the new modules are updated.
 
-Both phases share the same diffusion training loop:
+Both phases share the same diffusion training loop with **per-level noise**:
     1. Sample t ~ U(eps, 1)
-    2. Compute sigma(t), move_chance = 1 - exp(-sigma)
-    3. Mask tokens with probability move_chance (title tokens are exempt)
+    2. Compute base sigma(t) and per-level masking probabilities
+       (level 0 / summary = low noise, level 1 / content = high noise)
+    3. Mask tokens per-level (title tokens are exempt)
     4. Forward through the model → per-level logits
-    5. Compute the hierarchical SUBS loss (only on masked, non-title tokens)
+    5. Compute the hierarchical SUBS loss with per-level ELBO weights
     6. Backprop + optimizer step
 """
 
@@ -31,7 +32,7 @@ from torch.utils.data import DataLoader
 
 from models.hierarchical_generator import HierarchicalGenerator
 from models.hierarchy_embedding import HierarchyEmbedding
-from noise_schedule import Noise, get_noise_schedule
+from noise_schedule import Noise, HierarchicalNoiseSchedule, get_noise_schedule
 from lora.lora import (
     apply_lora_to_model,
     freeze_non_lora,
@@ -59,6 +60,8 @@ class TrainerConfig:
     noise_type: str = "loglinear"
     sampling_eps: float = 1e-3
     antithetic_sampling: bool = True
+    # Per-level noise scales:  level 0 = summary (low), level 1 = text (high)
+    noise_level_scales: list[float] = field(default_factory=lambda: [0.5, 1.0])
 
     # --- LoRA ---
     lora_rank: int = 8
@@ -115,9 +118,13 @@ class HierarchicalMDLMTrainer:
         self.model.to(config.device)
         self.mask_index = self.model.mask_index
 
-        # ── noise schedule ─────────────────────────────────────────────
-        self.noise: Noise = get_noise_schedule(config.noise_type)
-        self.noise.to(config.device)
+        # ── noise schedule (per-level) ─────────────────────────────────
+        base_noise: Noise = get_noise_schedule(config.noise_type)
+        self.hier_noise = HierarchicalNoiseSchedule(
+            base_noise=base_noise,
+            level_scales=config.noise_level_scales,
+        )
+        self.hier_noise.to(config.device)
 
         os.makedirs(config.save_dir, exist_ok=True)
 
@@ -133,25 +140,37 @@ class HierarchicalMDLMTrainer:
             eps_t = (eps_t / batch_size + offset) % 1
         return (1 - self.config.sampling_eps) * eps_t + self.config.sampling_eps
 
-    def _q_xt(
+    def _q_xt_per_level(
         self,
         x0: torch.Tensor,
-        move_chance: torch.Tensor,
+        hierarchy_labels: torch.Tensor,
+        per_level_move_chance: torch.Tensor,
         title_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Corrupt clean tokens by masking — title tokens are never masked.
+        """Corrupt clean tokens with **per-level** masking probabilities.
+
+        Each token is masked independently with probability determined by
+        its hierarchy level.  Title tokens are never masked.
 
         Args:
-            x0:         (B, L) clean token ids.
-            move_chance: (B, 1) per-sample masking probability.
-            title_mask:  (B, L) float, 1.0 at title positions.
+            x0:                    (B, L) clean token ids.
+            hierarchy_labels:      (B, L) int level index per token.
+            per_level_move_chance: (B, K) masking probability per level.
+            title_mask:            (B, L) float, 1.0 at title positions.
 
         Returns:
             xt: (B, L) noisy tokens.
         """
+        # Gather the move_chance for each token based on its level
+        token_move_chance = torch.gather(
+            per_level_move_chance,
+            dim=1,
+            index=hierarchy_labels.long(),
+        )  # (B, L)
+
         rand = torch.rand_like(x0.float())
-        move_indices = rand < move_chance                  # (B, L)
-        move_indices = move_indices & (title_mask < 0.5)   # protect title
+        move_indices = rand < token_move_chance              # (B, L)
+        move_indices = move_indices & (title_mask < 0.5)     # protect title
         return torch.where(move_indices, self.mask_index, x0)
 
     # ------------------------------------------------------------------
@@ -178,34 +197,40 @@ class HierarchicalMDLMTrainer:
 
         B = x0.shape[0]
 
-        # 1. Sample timestep
-        t = self._sample_t(B, device)                      # (B,)
-        sigma, dsigma = self.noise(t)                      # (B,), (B,)
-        move_chance = 1.0 - torch.exp(-sigma)              # (B,)
+        # 1. Sample timestep → base sigma
+        t = self._sample_t(B, device)                             # (B,)
+        sigma, dsigma = self.hier_noise(t)                        # (B,), (B,)
 
-        # 2. Corrupt (title tokens stay clean)
-        xt = self._q_xt(x0, move_chance.unsqueeze(1), title_mask)
+        # 2. Per-level masking probabilities
+        per_level_mc = self.hier_noise.get_per_level_move_chance(sigma)  # (B, K)
 
-        # 3. Build hierarchy probs (one-hot during training)
+        # 3. Corrupt with per-level noise (title stays clean)
+        xt = self._q_xt_per_level(x0, hierarchy_labels, per_level_mc, title_mask)
+
+        # 4. Build hierarchy probs (one-hot during training)
         hier_probs = HierarchyEmbedding.labels_to_onehot(
             hierarchy_labels, self.config.num_levels
         )  # (B, L, K)
 
-        # 4. Forward
+        # 5. Forward
         logits_per_level = self.model(xt, sigma, hier_probs)
 
-        # 5. Loss (only on masked non-title tokens)
+        # 6. Per-level ELBO weights
+        per_level_weight = self.hier_noise.get_per_level_loss_weight(
+            sigma, dsigma
+        )  # (B, K)
+
+        # 7. Loss (only on masked non-title tokens, weighted per level)
         loss = self.model.compute_loss(
             logits_per_level=logits_per_level,
             xt=xt,
             x0=x0,
             hierarchy_labels=hierarchy_labels,
             title_mask=title_mask,
-            dsigma=dsigma,
-            sigma=sigma,
+            per_level_weight=per_level_weight,
         )
 
-        # 6. Backward
+        # 8. Backward
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:

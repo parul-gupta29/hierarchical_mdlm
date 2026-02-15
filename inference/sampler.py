@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 from models.hierarchical_generator import HierarchicalGenerator
 from models.hierarchy_embedding import HierarchyEmbedding
-from noise_schedule import Noise, get_noise_schedule
+from noise_schedule import Noise, HierarchicalNoiseSchedule, get_noise_schedule
 
 
 def _sample_categorical(probs: torch.Tensor) -> torch.Tensor:
@@ -42,13 +42,18 @@ class HierarchicalSampler:
         self,
         model: HierarchicalGenerator,
         noise: Noise | None = None,
+        level_scales: list[float] | None = None,
         num_steps: int = 1000,
         device: str = "cuda",
     ):
         self.model = model
         self.model.eval()
-        self.noise = noise or get_noise_schedule("loglinear")
-        self.noise.to(device)
+        base_noise = noise or get_noise_schedule("loglinear")
+        self.hier_noise = HierarchicalNoiseSchedule(
+            base_noise=base_noise,
+            level_scales=level_scales or [0.5, 1.0],
+        )
+        self.hier_noise.to(device)
         self.num_steps = num_steps
         self.device = device
         self.mask_index = model.mask_index
@@ -162,7 +167,7 @@ class HierarchicalSampler:
         move_chance_s = (t - dt)[:, None, None]
 
         if p_x0_cache is None:
-            sigma_t = self.noise.total_noise(t)
+            sigma_t = self.hier_noise.base_noise.total_noise(t)
             p_x0 = self._get_combined_logits(x, sigma_t, hierarchy_probs)
         else:
             p_x0 = p_x0_cache
@@ -191,7 +196,7 @@ class HierarchicalSampler:
         title_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Final noise-removal step: argmax of combined probabilities."""
-        sigma = self.noise.total_noise(
+        sigma = self.hier_noise.base_noise.total_noise(
             t_final * torch.ones(x.shape[0], device=self.device)
         )
         p_x0 = self._get_combined_logits(x, sigma, hierarchy_probs)
