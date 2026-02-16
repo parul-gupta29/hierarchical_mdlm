@@ -30,7 +30,7 @@ lora_dropout: 0.05
 phase1_lr: 1.0e-4
 phase1_weight_decay: 0.0
 phase1_max_steps: 10000
-phase1_batch_size: 32
+phase1_batch_size: 8
 phase1_grad_clip: 1.0
 phase1_warmup_steps: 500        # linear warmup from 0 → phase1_lr
 phase1_min_lr: 1.0e-6           # cosine decay target after warmup
@@ -45,8 +45,12 @@ phase2_lora_target_modules:
 phase2_lr: 3.0e-5
 phase2_weight_decay: 0.01
 phase2_max_steps: 50000
-phase2_batch_size: 16
+phase2_batch_size: 4
 phase2_grad_clip: 1.0
+
+# Memory / mixed-precision
+use_amp: true                         # automatic mixed precision (fp16)
+grad_accum_steps: 4                   # gradient accumulation (effective batch = batch_size × accum)
 
 # General
 device: "cuda"
