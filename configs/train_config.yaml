@@ -26,18 +26,14 @@ lora_rank: 8
 lora_alpha: 16.0
 lora_dropout: 0.05
 
-# Phase 1: LoRA on output heads + hierarchy embedding (backbone frozen)
-phase1_lora_target_modules:
-  - ".*\\.adaLN_modulation$"     # VocabHead adaptive layer-norm projection
-  - ".*\\.mlp\\.0$"              # VocabHead hidden projection
-  - ".*\\.mlp\\.2$"              # VocabHead vocab projection
+# Phase 1: Full fine-tune output heads + hierarchy embedding (backbone frozen)
 phase1_lr: 1.0e-4
 phase1_weight_decay: 0.0
 phase1_max_steps: 10000
 phase1_batch_size: 16
 phase1_grad_clip: 1.0
 
-# Phase 2: LoRA on full architecture (backbone + output heads from Phase 1)
+# Phase 2: Backbone LoRA + continued full fine-tune of output heads
 phase2_lora_target_modules:
   - ".*\\.attn_qkv$"            # DDiT attention QKV
   - ".*\\.attn_out$"            # DDiT attention output
