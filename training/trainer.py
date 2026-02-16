@@ -1,15 +1,16 @@
-"""Two-phase hierarchical MDLM trainer.
+"""Two-phase hierarchical MDLM trainer — both phases use LoRA.
 
-Phase 1 — **Hierarchy-only fine-tuning**
-    Freeze the entire DDiT backbone.  Train only:
-        • HierarchyEmbedding  (new parameters)
-        • MultiHeadVocabOutput (new parameters)
+Phase 1 — **Hierarchy-layer LoRA fine-tuning**
+    Freeze the entire DDiT backbone.  Apply LoRA to the output-head linear
+    layers (adaLN_modulation, mlp.0, mlp.2 in each VocabHead).  Train:
+        • HierarchyEmbedding   (full — only 1 536 params)
+        • Output-head LoRA A/B matrices
 
-Phase 2 — **Full LoRA fine-tuning**
-    Attach LoRA adapters to every attention / MLP projection in the backbone
-    and unfreeze them together with the hierarchy + output-head parameters.
-    The original backbone weights remain frozen; only the low-rank residuals
-    and the new modules are updated.
+Phase 2 — **Full-architecture LoRA fine-tuning**
+    Additionally attach LoRA adapters to every attention / MLP projection
+    in the DDiT backbone.  Train:
+        • All LoRA adapters   (output heads from Phase 1 + new backbone ones)
+        • HierarchyEmbedding  (full)
 
 Both phases share the same diffusion training loop with **per-level noise**:
     1. Sample t ~ U(eps, 1)
@@ -67,7 +68,14 @@ class TrainerConfig:
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.05
-    lora_target_modules: list[str] = field(default_factory=lambda: [
+    # Phase 1 targets: output-head linear layers only
+    phase1_lora_target_modules: list[str] = field(default_factory=lambda: [
+        r".*\.adaLN_modulation$",
+        r".*\.mlp\.0$",
+        r".*\.mlp\.2$",
+    ])
+    # Phase 2 targets: backbone attention + MLP (added on top of Phase 1)
+    phase2_lora_target_modules: list[str] = field(default_factory=lambda: [
         r".*\.attn_qkv$",
         r".*\.attn_out$",
         r".*\.mlp\.0$",
@@ -270,23 +278,32 @@ class HierarchicalMDLMTrainer:
         print(f"[{phase_name}] Finished — {step} steps, {epoch} epochs.")
 
     # ------------------------------------------------------------------
-    #  Phase 1: train hierarchy embedding + output heads only
+    #  Phase 1: LoRA fine-tune hierarchy layers (output heads + embedding)
     # ------------------------------------------------------------------
 
     def run_phase1(self, dataloader: DataLoader) -> None:
-        """Freeze backbone; train hierarchy embedding + output heads."""
+        """Apply LoRA to output heads; train LoRA + hierarchy embedding."""
         print("=" * 60)
-        print("PHASE 1: Hierarchy embedding + output heads")
+        print("PHASE 1: LoRA on output heads + hierarchy embedding")
         print("=" * 60)
 
-        # Freeze everything
+        # Freeze everything first
         for param in self.model.parameters():
             param.requires_grad_(False)
 
-        # Unfreeze new components
+        # Attach LoRA to output-head linear layers
+        apply_lora_to_model(
+            self.model.output_heads,
+            target_modules=self.config.phase1_lora_target_modules,
+            rank=self.config.lora_rank,
+            alpha=self.config.lora_alpha,
+            dropout=self.config.lora_dropout,
+        )
+        self.model.to(self.config.device)
+
+        # Unfreeze: LoRA params + hierarchy embedding (full, only 1536 params)
+        unfreeze_all_lora(self.model)
         for param in self.model.hierarchy_embedding.parameters():
-            param.requires_grad_(True)
-        for param in self.model.output_heads.parameters():
             param.requires_grad_(True)
 
         print_trainable_summary(self.model, "Phase 1")
@@ -306,31 +323,32 @@ class HierarchicalMDLMTrainer:
         )
 
     # ------------------------------------------------------------------
-    #  Phase 2: LoRA fine-tune entire model
+    #  Phase 2: LoRA fine-tune entire architecture
     # ------------------------------------------------------------------
 
     def run_phase2(self, dataloader: DataLoader) -> None:
-        """Add LoRA to backbone; fine-tune LoRA + hierarchy + output heads."""
+        """Add LoRA to backbone; fine-tune all LoRA + hierarchy embedding."""
         print("=" * 60)
-        print("PHASE 2: LoRA fine-tuning of full model")
+        print("PHASE 2: LoRA fine-tuning of full architecture")
         print("=" * 60)
 
-        # Attach LoRA to backbone blocks
+        # Attach LoRA to backbone attention + MLP layers
+        # (output-head LoRA from Phase 1 is already present)
         apply_lora_to_model(
             self.model.backbone,
-            target_modules=self.config.lora_target_modules,
+            target_modules=self.config.phase2_lora_target_modules,
             rank=self.config.lora_rank,
             alpha=self.config.lora_alpha,
             dropout=self.config.lora_dropout,
         )
         self.model.to(self.config.device)
 
-        # Freeze original weights, unfreeze LoRA + new modules
+        # Freeze all original weights, unfreeze every LoRA adapter
+        # (both output-head LoRA from P1 and new backbone LoRA)
         freeze_non_lora(self.model)
         unfreeze_all_lora(self.model)
+        # Hierarchy embedding stays fully trainable
         for param in self.model.hierarchy_embedding.parameters():
-            param.requires_grad_(True)
-        for param in self.model.output_heads.parameters():
             param.requires_grad_(True)
 
         print_trainable_summary(self.model, "Phase 2")

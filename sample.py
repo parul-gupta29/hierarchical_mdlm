@@ -58,11 +58,26 @@ def main():
         cond_dim=config.cond_dim,
     )
 
-    # If Phase 2 checkpoint, re-attach LoRA shells before loading weights
-    if ckpt.get("phase", "").startswith("Phase2"):
+    # Re-attach LoRA shells before loading weights.
+    # Phase 1 checkpoints have LoRA on output heads only.
+    # Phase 2 checkpoints have LoRA on output heads + backbone.
+    phase = ckpt.get("phase", "")
+
+    # Always re-attach output-head LoRA (present in both phases)
+    if phase.startswith("Phase1") or phase.startswith("Phase2"):
+        apply_lora_to_model(
+            model.output_heads,
+            target_modules=config.phase1_lora_target_modules,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            dropout=0.0,
+        )
+
+    # Phase 2 also has backbone LoRA
+    if phase.startswith("Phase2"):
         apply_lora_to_model(
             model.backbone,
-            target_modules=config.lora_target_modules,
+            target_modules=config.phase2_lora_target_modules,
             rank=config.lora_rank,
             alpha=config.lora_alpha,
             dropout=0.0,
