@@ -74,6 +74,10 @@ class WikiHowHierarchyDataset(Dataset):
 
     def _encode(self, title: str, summary: str, text: str) -> dict:
         """Tokenise one WikiHow article into the hierarchical format."""
+        # Some rows may have None fields — coerce to empty string.
+        title = title or ""
+        summary = summary or ""
+        text = text or ""
         title_ids = self.tokenizer.encode(title, add_special_tokens=False)
         summary_ids = self.tokenizer.encode(summary, add_special_tokens=False)
         text_ids = self.tokenizer.encode(text, add_special_tokens=False)
