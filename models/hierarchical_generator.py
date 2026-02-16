@@ -49,7 +49,7 @@ class HierarchicalGenerator(nn.Module):
         config_overrides: optional dict merged into the backbone config.
     """
 
-    NEG_INF = -1_000_000.0
+    NEG_INF = -1e4  # fp16-safe (max fp16 ≈ 65504)
 
     def __init__(
         self,
