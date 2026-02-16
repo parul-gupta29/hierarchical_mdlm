@@ -84,7 +84,7 @@ class TrainerConfig:
     phase1_lr: float = 1e-4
     phase1_weight_decay: float = 0.0
     phase1_max_steps: int = 10_000
-    phase1_batch_size: int = 32
+    phase1_batch_size: int = 8
     phase1_grad_clip: float = 1.0
     phase1_warmup_steps: int = 500
     phase1_min_lr: float = 1e-6
@@ -94,8 +94,12 @@ class TrainerConfig:
     phase2_lr: float = 3e-5
     phase2_weight_decay: float = 0.01
     phase2_max_steps: int = 50_000
-    phase2_batch_size: int = 16
+    phase2_batch_size: int = 4
     phase2_grad_clip: float = 1.0
+
+    # --- memory / mixed-precision ---
+    use_amp: bool = True                # automatic mixed precision (fp16)
+    grad_accum_steps: int = 4           # gradient accumulation steps
 
     # --- general ---
     device: str = "cuda"
@@ -142,6 +146,9 @@ class HierarchicalMDLMTrainer:
         self.hier_noise.to(config.device)
 
         os.makedirs(config.save_dir, exist_ok=True)
+
+        # ── mixed-precision scaler ────────────────────────────────────
+        self.scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
 
         # ── wandb ─────────────────────────────────────────────────────
         self._init_wandb()
@@ -213,23 +220,16 @@ class HierarchicalMDLMTrainer:
     #  Single training step
     # ------------------------------------------------------------------
 
-    def _train_step(
+    def _forward_loss(
         self,
         batch: dict[str, torch.Tensor],
-        optimizer: torch.optim.Optimizer,
-        grad_clip: float,
-    ) -> tuple[float, float]:
-        """Execute one gradient-update step.
-
-        Returns (loss, grad_norm) as scalar values.
-        """
-        self.model.train()
+    ) -> torch.Tensor:
+        """Compute forward pass and return the scalar loss (inside AMP context)."""
         device = self.config.device
 
         x0 = batch["input_ids"].to(device)                # (B, L)
         hierarchy_labels = batch["hierarchy_labels"].to(device)  # (B, L)
         title_mask = batch["title_mask"].to(device)        # (B, L)
-        attention_mask = batch["attention_mask"].to(device)  # (B, L)
 
         B = x0.shape[0]
 
@@ -257,7 +257,7 @@ class HierarchicalMDLMTrainer:
         )  # (B, K)
 
         # 7. Loss (only on masked non-title tokens, weighted per level)
-        loss = self.model.compute_loss(
+        return self.model.compute_loss(
             logits_per_level=logits_per_level,
             xt=xt,
             x0=x0,
@@ -265,17 +265,6 @@ class HierarchicalMDLMTrainer:
             title_mask=title_mask,
             per_level_weight=per_level_weight,
         )
-
-        # 8. Backward
-        optimizer.zero_grad()
-        loss.backward()
-        trainable_params = list(get_trainable_parameters(self.model))
-        if grad_clip > 0:
-            grad_norm = nn.utils.clip_grad_norm_(trainable_params, grad_clip).item()
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float("inf")).item()
-        optimizer.step()
-        return loss.item(), grad_norm
 
     # ------------------------------------------------------------------
     #  Phase loops
@@ -318,34 +307,67 @@ class HierarchicalMDLMTrainer:
         grad_clip: float,
         scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     ) -> None:
-        step = 0
+        accum = self.config.grad_accum_steps
+        step = 0          # optimizer steps (after accumulation)
+        micro_step = 0    # micro-batch counter within an accumulation window
         epoch = 0
+        accum_loss = 0.0
+
+        optimizer.zero_grad()
+
         while step < max_steps:
             epoch += 1
             for batch in dataloader:
                 if step >= max_steps:
                     break
+
                 t0 = time.monotonic()
-                loss_val, grad_norm = self._train_step(batch, optimizer, grad_clip)
-                if scheduler is not None:
-                    scheduler.step()
-                step_time = time.monotonic() - t0
-                step += 1
+                self.model.train()
 
-                lr = optimizer.param_groups[0]["lr"]
-                if step % self.config.log_every == 0:
-                    print(f"[{phase_name}] step {step}/{max_steps}  loss={loss_val:.4f}  lr={lr:.2e}")
-                    wandb.log({
-                        f"{phase_name}/loss": loss_val,
-                        f"{phase_name}/grad_norm": grad_norm,
-                        f"{phase_name}/lr": lr,
-                        f"{phase_name}/step_time_s": step_time,
-                        f"{phase_name}/epoch": epoch,
-                        "global_step": step,
-                    }, step=step)
+                # --- micro-step: forward + scaled backward (no optimizer step yet) ---
+                with torch.amp.autocast("cuda", enabled=self.config.use_amp):
+                    loss = self._forward_loss(batch)
+                    loss_for_accum = loss / accum
 
-                if step % self.config.save_every == 0:
-                    self._save_checkpoint(phase_name, step)
+                self.scaler.scale(loss_for_accum).backward()
+                accum_loss += loss.item()
+                micro_step += 1
+
+                # --- optimizer step after `accum` micro-steps ---
+                if micro_step % accum == 0:
+                    self.scaler.unscale_(optimizer)
+                    trainable_params = list(get_trainable_parameters(self.model))
+                    if grad_clip > 0:
+                        grad_norm = nn.utils.clip_grad_norm_(trainable_params, grad_clip).item()
+                    else:
+                        grad_norm = nn.utils.clip_grad_norm_(trainable_params, float("inf")).item()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                    optimizer.zero_grad()
+
+                    if scheduler is not None:
+                        scheduler.step()
+
+                    step += 1
+                    avg_loss = accum_loss / accum
+                    step_time = time.monotonic() - t0
+                    accum_loss = 0.0
+
+                    lr = optimizer.param_groups[0]["lr"]
+                    if step % self.config.log_every == 0:
+                        print(f"[{phase_name}] step {step}/{max_steps}  "
+                              f"loss={avg_loss:.4f}  lr={lr:.2e}")
+                        wandb.log({
+                            f"{phase_name}/loss": avg_loss,
+                            f"{phase_name}/grad_norm": grad_norm,
+                            f"{phase_name}/lr": lr,
+                            f"{phase_name}/step_time_s": step_time,
+                            f"{phase_name}/epoch": epoch,
+                            "global_step": step,
+                        }, step=step)
+
+                    if step % self.config.save_every == 0:
+                        self._save_checkpoint(phase_name, step)
 
         self._save_checkpoint(phase_name, step)
         print(f"[{phase_name}] Finished — {step} steps, {epoch} epochs.")

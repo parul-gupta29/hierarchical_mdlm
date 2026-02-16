@@ -183,18 +183,26 @@ class HierarchicalGenerator(nn.Module):
         is_masked = (xt == self.mask_index).float()               # (B, L)
         loss_mask = is_masked * (1.0 - title_mask.float())        # (B, L)
 
-        # Apply subs parameterization per head and gather log-probs at x0
-        log_probs_at_x0 = torch.stack(
-            [
-                torch.gather(
-                    self.subs_parameterization(logits.clone(), xt),
-                    dim=-1,
-                    index=x0.unsqueeze(-1),
-                ).squeeze(-1)
-                for logits in logits_per_level
-            ],
-            dim=-1,
-        )  # (B, L, K)
+        # Compute log p(x0 | xt) per head *without* materialising full (B,L,V)
+        # log-prob tensors.  For masked positions the subs parameterization is:
+        #   log p(x0) = logits[x0] - logsumexp(logits with mask-logit = -inf)
+        # For unmasked positions the loss_mask zeros them out anyway, so we
+        # just need a safe finite value (0.0).
+        x0_idx = x0.unsqueeze(-1)                                # (B, L, 1)
+        is_masked = (xt == self.mask_index)                       # (B, L)
+
+        log_probs_list: list[torch.Tensor] = []
+        for logits in logits_per_level:
+            # Gather raw logit at x0 position: (B, L)
+            logit_at_x0 = torch.gather(logits, dim=-1, index=x0_idx).squeeze(-1)
+            # Set mask-token logit to -inf for logsumexp
+            logits[:, :, self.mask_index] += self.NEG_INF
+            lse = torch.logsumexp(logits, dim=-1)                 # (B, L)
+            # log p(x0) at masked positions; 0 elsewhere (masked out later)
+            lp = torch.where(is_masked, logit_at_x0 - lse, torch.zeros_like(lse))
+            log_probs_list.append(lp)
+
+        log_probs_at_x0 = torch.stack(log_probs_list, dim=-1)    # (B, L, K)
 
         # Select the log-prob from the head matching the GT level
         level_idx = hierarchy_labels.unsqueeze(-1).long()         # (B, L, 1)
