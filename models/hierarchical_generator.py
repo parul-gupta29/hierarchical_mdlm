@@ -191,13 +191,18 @@ class HierarchicalGenerator(nn.Module):
         x0_idx = x0.unsqueeze(-1)                                # (B, L, 1)
         is_masked = (xt == self.mask_index)                       # (B, L)
 
+        # Pre-compute a bias vector to subtract mask-token from logsumexp.
+        # Shape (1, 1, V) — adds NEG_INF only at mask_index, 0 elsewhere.
+        V = logits_per_level[0].shape[-1]
+        mask_bias = logits_per_level[0].new_zeros(V)
+        mask_bias[self.mask_index] = self.NEG_INF                 # (V,)
+
         log_probs_list: list[torch.Tensor] = []
         for logits in logits_per_level:
             # Gather raw logit at x0 position: (B, L)
             logit_at_x0 = torch.gather(logits, dim=-1, index=x0_idx).squeeze(-1)
-            # Set mask-token logit to -inf for logsumexp
-            logits[:, :, self.mask_index] += self.NEG_INF
-            lse = torch.logsumexp(logits, dim=-1)                 # (B, L)
+            # Exclude mask token from logsumexp via additive bias (no in-place op)
+            lse = torch.logsumexp(logits + mask_bias, dim=-1)     # (B, L)
             # log p(x0) at masked positions; 0 elsewhere (masked out later)
             lp = torch.where(is_masked, logit_at_x0 - lse, torch.zeros_like(lse))
             log_probs_list.append(lp)
