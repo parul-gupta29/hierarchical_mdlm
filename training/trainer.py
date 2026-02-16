@@ -25,10 +25,12 @@ Both phases share the same diffusion training loop with **per-level noise**:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
 
 import torch
 import torch.nn as nn
+import wandb
 from torch.utils.data import DataLoader
 
 from models.hierarchical_generator import HierarchicalGenerator
@@ -103,6 +105,12 @@ class TrainerConfig:
     save_dir: str = "checkpoints"
     seed: int = 42
 
+    # --- wandb ---
+    wandb_project: str = "hierarchical-mdlm"
+    wandb_entity: str = ""
+    wandb_run_name: str = ""
+    wandb_mode: str = "online"  # "online", "offline", or "disabled"
+
 
 # ---------------------------------------------------------------------------
 #  Trainer
@@ -135,6 +143,27 @@ class HierarchicalMDLMTrainer:
         self.hier_noise.to(config.device)
 
         os.makedirs(config.save_dir, exist_ok=True)
+
+        # ── wandb ─────────────────────────────────────────────────────
+        self._init_wandb()
+
+    def _init_wandb(self) -> None:
+        """Initialize Weights & Biases run."""
+        cfg = self.config
+        init_kwargs: dict = {
+            "project": cfg.wandb_project,
+            "config": asdict(cfg),
+            "mode": cfg.wandb_mode,
+        }
+        if cfg.wandb_entity:
+            init_kwargs["entity"] = cfg.wandb_entity
+        if cfg.wandb_run_name:
+            init_kwargs["name"] = cfg.wandb_run_name
+        wandb.init(**init_kwargs)
+
+    def finish(self) -> None:
+        """Finish the current wandb run."""
+        wandb.finish()
 
     # ------------------------------------------------------------------
     #  Diffusion helpers
@@ -190,10 +219,10 @@ class HierarchicalMDLMTrainer:
         batch: dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
         grad_clip: float,
-    ) -> float:
+    ) -> tuple[float, float]:
         """Execute one gradient-update step.
 
-        Returns the scalar loss value.
+        Returns (loss, grad_norm) as scalar values.
         """
         self.model.train()
         device = self.config.device
@@ -241,12 +270,13 @@ class HierarchicalMDLMTrainer:
         # 8. Backward
         optimizer.zero_grad()
         loss.backward()
+        trainable_params = list(get_trainable_parameters(self.model))
         if grad_clip > 0:
-            nn.utils.clip_grad_norm_(
-                get_trainable_parameters(self.model), grad_clip
-            )
+            grad_norm = nn.utils.clip_grad_norm_(trainable_params, grad_clip).item()
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float("inf")).item()
         optimizer.step()
-        return loss.item()
+        return loss.item(), grad_norm
 
     # ------------------------------------------------------------------
     #  Phase loops
@@ -262,15 +292,28 @@ class HierarchicalMDLMTrainer:
     ) -> None:
         step = 0
         epoch = 0
+        lr = optimizer.param_groups[0]["lr"]
         while step < max_steps:
             epoch += 1
             for batch in dataloader:
                 if step >= max_steps:
                     break
-                loss_val = self._train_step(batch, optimizer, grad_clip)
+                t0 = time.monotonic()
+                loss_val, grad_norm = self._train_step(batch, optimizer, grad_clip)
+                step_time = time.monotonic() - t0
                 step += 1
+
                 if step % self.config.log_every == 0:
                     print(f"[{phase_name}] step {step}/{max_steps}  loss={loss_val:.4f}")
+                    wandb.log({
+                        f"{phase_name}/loss": loss_val,
+                        f"{phase_name}/grad_norm": grad_norm,
+                        f"{phase_name}/lr": lr,
+                        f"{phase_name}/step_time_s": step_time,
+                        f"{phase_name}/epoch": epoch,
+                        "global_step": step,
+                    }, step=step)
+
                 if step % self.config.save_every == 0:
                     self._save_checkpoint(phase_name, step)
 

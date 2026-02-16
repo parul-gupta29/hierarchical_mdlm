@@ -55,3 +55,9 @@ log_every: 100
 save_every: 5000
 save_dir: "checkpoints"
 seed: 42
+
+# Weights & Biases
+wandb_project: "hierarchical-mdlm"
+wandb_entity: ""                    # leave empty to use default entity
+wandb_run_name: ""                  # leave empty for auto-generated name
+wandb_mode: "online"                # "online", "offline", or "disabled"

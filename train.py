@@ -128,10 +128,23 @@ def main():
     parser.add_argument("--noise_level_scales", type=float, nargs="+", default=None,
                         help="Per-level noise scales (e.g. 0.5 1.0).")
 
+    # wandb overrides
+    parser.add_argument("--wandb_project", type=str, default=None,
+                        help="W&B project name (default: hierarchical-mdlm).")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B team/entity name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="W&B run name (auto-generated if empty).")
+    parser.add_argument("--wandb_mode", type=str, default=None,
+                        choices=["online", "offline", "disabled"],
+                        help="W&B logging mode.")
+
     # Allow any scalar TrainerConfig field as a CLI override
     for field_name, field_obj in TrainerConfig.__dataclass_fields__.items():
         if field_name in ("noise_level_scales", "phase1_lora_target_modules",
-                          "phase2_lora_target_modules"):
+                          "phase2_lora_target_modules",
+                          "wandb_project", "wandb_entity",
+                          "wandb_run_name", "wandb_mode"):
             continue  # handled above or complex type
         tp = field_obj.type
         if tp in ("int", int):
@@ -198,6 +211,7 @@ def main():
         trainer.run_phase1(dl)
         trainer.run_phase2(make_dl(config.phase2_batch_size))
 
+    trainer.finish()
     print("Training complete.")
 
 
