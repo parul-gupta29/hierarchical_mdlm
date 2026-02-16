@@ -88,6 +88,7 @@ class TrainerConfig:
     phase1_grad_clip: float = 1.0
     phase1_warmup_steps: int = 500
     phase1_min_lr: float = 1e-6
+    phase1_unfreeze_last_n_blocks: int = 4  # unfreeze last N DDiT blocks
 
     # --- phase 2 ---
     phase2_lr: float = 3e-5
@@ -369,6 +370,15 @@ class HierarchicalMDLMTrainer:
         # Hierarchy embedding is also randomly initialized (only 1536 params)
         for param in self.model.hierarchy_embedding.parameters():
             param.requires_grad_(True)
+
+        # Unfreeze the last N DDiT blocks so the backbone can begin
+        # adapting its representations to the hierarchy structure.
+        n = self.config.phase1_unfreeze_last_n_blocks
+        if n > 0:
+            total_blocks = len(self.model.backbone.blocks)
+            for block in self.model.backbone.blocks[total_blocks - n :]:
+                for param in block.parameters():
+                    param.requires_grad_(True)
 
         print_trainable_summary(self.model, "Phase 1")
 
