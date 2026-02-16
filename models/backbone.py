@@ -72,14 +72,14 @@ def bias_dropout_add_scale_fused_inference(
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale) + shift
 
 
 @torch.jit.script
 def modulate_fused(
     x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale) + shift
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ class LayerNorm(nn.Module):
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             x = F.layer_norm(x.float(), [self.dim])
         return x * self.weight[None, None, :]
 
@@ -210,7 +210,7 @@ class DDiTBlock(nn.Module):
         qkv = rearrange(
             qkv, "b s (three h d) -> b s three h d", three=3, h=self.n_heads
         )
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             cos, sin = rotary_cos_sin
             qkv = apply_rotary_pos_emb(qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
         qkv = rearrange(qkv, "b s ... -> (b s) ...")
@@ -294,7 +294,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         x = self.vocab_embed(indices)
         c = F.silu(self.sigma_map(sigma))
         rotary_cos_sin = self.rotary_emb(x)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             for block in self.blocks:
                 x = block(x, rotary_cos_sin, c)
             x = self.output_layer(x, c)
@@ -398,7 +398,7 @@ class DDiTBackbone(nn.Module):
         """
         c = F.silu(self.sigma_map(sigma))
         rotary_cos_sin = self.rotary_emb(x)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             for block in self.blocks:
                 x = block(x, rotary_cos_sin, c)
         return x
