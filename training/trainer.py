@@ -28,6 +28,8 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 
+import math
+
 import torch
 import torch.nn as nn
 import wandb
@@ -82,8 +84,10 @@ class TrainerConfig:
     phase1_lr: float = 1e-4
     phase1_weight_decay: float = 0.0
     phase1_max_steps: int = 10_000
-    phase1_batch_size: int = 16
+    phase1_batch_size: int = 32
     phase1_grad_clip: float = 1.0
+    phase1_warmup_steps: int = 500
+    phase1_min_lr: float = 1e-6
 
     # --- phase 2 ---
     phase2_lr: float = 3e-5
@@ -276,6 +280,34 @@ class HierarchicalMDLMTrainer:
     #  Phase loops
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _build_warmup_cosine_scheduler(
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        max_steps: int,
+        min_lr: float,
+    ) -> torch.optim.lr_scheduler.LambdaLR | None:
+        """Linear warmup then cosine decay to *min_lr*.
+
+        Returns ``None`` when *warmup_steps* <= 0 (no scheduling).
+        """
+        if warmup_steps <= 0:
+            return None
+
+        base_lr = optimizer.param_groups[0]["lr"]
+
+        def lr_lambda(current_step: int) -> float:
+            # Linear warmup
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            # Cosine decay from base_lr → min_lr
+            progress = (current_step - warmup_steps) / max(1, max_steps - warmup_steps)
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Scale so that lr decays from base_lr to min_lr
+            return max(min_lr / base_lr, cosine_decay)
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     def _run_phase(
         self,
         phase_name: str,
@@ -283,10 +315,10 @@ class HierarchicalMDLMTrainer:
         optimizer: torch.optim.Optimizer,
         max_steps: int,
         grad_clip: float,
+        scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     ) -> None:
         step = 0
         epoch = 0
-        lr = optimizer.param_groups[0]["lr"]
         while step < max_steps:
             epoch += 1
             for batch in dataloader:
@@ -294,11 +326,14 @@ class HierarchicalMDLMTrainer:
                     break
                 t0 = time.monotonic()
                 loss_val, grad_norm = self._train_step(batch, optimizer, grad_clip)
+                if scheduler is not None:
+                    scheduler.step()
                 step_time = time.monotonic() - t0
                 step += 1
 
+                lr = optimizer.param_groups[0]["lr"]
                 if step % self.config.log_every == 0:
-                    print(f"[{phase_name}] step {step}/{max_steps}  loss={loss_val:.4f}")
+                    print(f"[{phase_name}] step {step}/{max_steps}  loss={loss_val:.4f}  lr={lr:.2e}")
                     wandb.log({
                         f"{phase_name}/loss": loss_val,
                         f"{phase_name}/grad_norm": grad_norm,
@@ -343,12 +378,20 @@ class HierarchicalMDLMTrainer:
             weight_decay=self.config.phase1_weight_decay,
         )
 
+        scheduler = self._build_warmup_cosine_scheduler(
+            optimizer,
+            warmup_steps=self.config.phase1_warmup_steps,
+            max_steps=self.config.phase1_max_steps,
+            min_lr=self.config.phase1_min_lr,
+        )
+
         self._run_phase(
             "Phase1",
             dataloader,
             optimizer,
             self.config.phase1_max_steps,
             self.config.phase1_grad_clip,
+            scheduler=scheduler,
         )
 
     # ------------------------------------------------------------------
