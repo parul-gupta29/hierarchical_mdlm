@@ -361,21 +361,47 @@ class DDiTBackbone(nn.Module):
         self.original_output_layer = self.dit.output_layer
 
     def _load_pretrained(self, path: str, vocab_size: int):
-        """Load weights from a HuggingFace-hosted MDLM checkpoint."""
+        """Load weights from a HuggingFace-hosted MDLM checkpoint.
+
+        The upstream ``kuleshov-group/mdlm-owt`` stores weights under an
+        ``MDLM`` wrapper whose only child is ``backbone`` (a ``DITBackbone``).
+        The saved state-dict keys therefore look like
+        ``backbone.vocab_embed.embedding``, ``backbone.blocks.0.norm1.weight``,
+        etc.  We strip the ``backbone.`` prefix so the keys align with our
+        ``DIT`` module.
+        """
         try:
-            pretrained = DIT.from_pretrained(path)
-            # The pretrained model may have vocab_size 50258 (50257 + mask token)
-            missing, unexpected = self.dit.load_state_dict(
-                pretrained.state_dict(), strict=False
+            from safetensors.torch import load_file as load_safetensors
+            ckpt_path = huggingface_hub.hf_hub_download(
+                path, filename="model.safetensors"
             )
-            if missing:
-                print(f"[DDiTBackbone] Missing keys (will init randomly): {missing}")
-            if unexpected:
-                print(f"[DDiTBackbone] Unexpected keys (ignored): {unexpected}")
-            del pretrained
-        except Exception as e:
-            print(f"[DDiTBackbone] Could not load pretrained weights from "
-                  f"'{path}': {e}. Starting from random init.")
+            raw_sd = load_safetensors(ckpt_path)
+        except Exception:
+            # Fallback: try pytorch_model.bin
+            try:
+                ckpt_path = huggingface_hub.hf_hub_download(
+                    path, filename="pytorch_model.bin"
+                )
+                raw_sd = torch.load(ckpt_path, map_location="cpu")
+            except Exception as e:
+                print(f"[DDiTBackbone] Could not download weights from "
+                      f"'{path}': {e}. Starting from random init.")
+                return
+
+        # Strip 'backbone.' prefix added by the upstream MDLM wrapper
+        prefix = "backbone."
+        cleaned_sd: dict[str, torch.Tensor] = {}
+        for k, v in raw_sd.items():
+            new_key = k[len(prefix):] if k.startswith(prefix) else k
+            cleaned_sd[new_key] = v
+
+        missing, unexpected = self.dit.load_state_dict(cleaned_sd, strict=False)
+        n_loaded = len(cleaned_sd) - len(unexpected)
+        print(f"[DDiTBackbone] Loaded {n_loaded} tensors from '{path}'.")
+        if missing:
+            print(f"[DDiTBackbone] Missing keys (will init randomly): {missing}")
+        if unexpected:
+            print(f"[DDiTBackbone] Unexpected keys (ignored): {unexpected}")
 
     # ---- public API -------------------------------------------------------
 
