@@ -16,10 +16,15 @@ No separator tokens are inserted between segments.
 
 from __future__ import annotations
 
+import logging
 import torch
 from torch.utils.data import Dataset
 import transformers
 from datasets import load_dataset
+
+# Suppress the "Token indices sequence length is longer than ..." warning
+# emitted by HuggingFace tokenizers.  Our code truncates *after* encoding.
+logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
 
 class WikiHowHierarchyDataset(Dataset):
