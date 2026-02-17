@@ -116,6 +116,11 @@ class HierarchicalNoiseSchedule(nn.Module):
     ) -> torch.Tensor:
         """Compute per-level ELBO loss weight: scale_k * dsigma / expm1(scale_k * sigma).
 
+        The raw weight approximates 1/t for the loglinear schedule, which
+        diverges as t → 0.  We clamp the denominator to avoid extreme
+        spikes that cause high-variance loss oscillation (especially with
+        small batch sizes).
+
         Args:
             sigma:  (B,) base sigma.
             dsigma: (B,) base dsigma.
@@ -126,7 +131,9 @@ class HierarchicalNoiseSchedule(nn.Module):
         scales = self.level_scales.unsqueeze(0)             # (1, K)
         scaled_sigma = sigma.unsqueeze(1) * scales          # (B, K)
         scaled_dsigma = dsigma.unsqueeze(1) * scales        # (B, K)
-        return scaled_dsigma / torch.expm1(scaled_sigma)    # (B, K)
+        # Clamp denominator to avoid near-zero division at small timesteps
+        denom = torch.expm1(scaled_sigma).clamp(min=1e-4)   # (B, K)
+        return scaled_dsigma / denom                         # (B, K)
 
 
 def get_noise_schedule(name: str = "loglinear", **kwargs) -> Noise:

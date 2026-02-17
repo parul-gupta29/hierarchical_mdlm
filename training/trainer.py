@@ -96,6 +96,8 @@ class TrainerConfig:
     phase2_max_steps: int = 50_000
     phase2_batch_size: int = 4
     phase2_grad_clip: float = 1.0
+    phase2_warmup_steps: int = 1000
+    phase2_min_lr: float = 1e-6
 
     # --- memory / mixed-precision ---
     use_amp: bool = True                # automatic mixed precision (fp16)
@@ -464,12 +466,20 @@ class HierarchicalMDLMTrainer:
             weight_decay=self.config.phase2_weight_decay,
         )
 
+        scheduler = self._build_warmup_cosine_scheduler(
+            optimizer,
+            warmup_steps=self.config.phase2_warmup_steps,
+            max_steps=self.config.phase2_max_steps,
+            min_lr=self.config.phase2_min_lr,
+        )
+
         self._run_phase(
             "Phase2",
             dataloader,
             optimizer,
             self.config.phase2_max_steps,
             self.config.phase2_grad_clip,
+            scheduler=scheduler,
         )
 
     # ------------------------------------------------------------------

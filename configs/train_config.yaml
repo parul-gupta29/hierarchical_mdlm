@@ -47,6 +47,8 @@ phase2_weight_decay: 0.01
 phase2_max_steps: 50000
 phase2_batch_size: 4
 phase2_grad_clip: 1.0
+phase2_warmup_steps: 1000          # linear warmup for newly initialised LoRA params
+phase2_min_lr: 1.0e-6              # cosine decay target after warmup
 
 # Memory / mixed-precision
 use_amp: true                         # automatic mixed precision (fp16)
