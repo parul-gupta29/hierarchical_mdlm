@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -101,6 +102,13 @@ def build_dataloader(
             num_levels=config.num_levels,
         )
 
+    def _worker_init_fn(worker_id: int) -> None:
+        # Suppress the tokenizer "Token indices sequence length is longer
+        # than ..." warning inside each DataLoader worker process.
+        logging.getLogger("transformers.tokenization_utils_base").setLevel(
+            logging.ERROR
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -109,6 +117,7 @@ def build_dataloader(
         num_workers=4,
         pin_memory=True,
         drop_last=True,
+        worker_init_fn=_worker_init_fn,
     )
 
 

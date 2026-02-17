@@ -312,6 +312,8 @@ class HierarchicalMDLMTrainer:
         micro_step = 0    # micro-batch counter within an accumulation window
         epoch = 0
         accum_loss = 0.0
+        ema_loss: float | None = None  # EMA-smoothed loss for trend tracking
+        ema_alpha = 0.05               # smoothing factor (lower = smoother)
 
         optimizer.zero_grad()
 
@@ -353,12 +355,19 @@ class HierarchicalMDLMTrainer:
                     step_time = time.monotonic() - t0
                     accum_loss = 0.0
 
+                    # Update EMA loss
+                    if ema_loss is None:
+                        ema_loss = avg_loss
+                    else:
+                        ema_loss = ema_alpha * avg_loss + (1 - ema_alpha) * ema_loss
+
                     lr = optimizer.param_groups[0]["lr"]
                     if step % self.config.log_every == 0:
                         print(f"[{phase_name}] step {step}/{max_steps}  "
-                              f"loss={avg_loss:.4f}  lr={lr:.2e}")
+                              f"loss={avg_loss:.4f}  ema={ema_loss:.4f}  lr={lr:.2e}")
                         wandb.log({
                             f"{phase_name}/loss": avg_loss,
+                            f"{phase_name}/loss_ema": ema_loss,
                             f"{phase_name}/grad_norm": grad_norm,
                             f"{phase_name}/lr": lr,
                             f"{phase_name}/step_time_s": step_time,
