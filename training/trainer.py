@@ -508,7 +508,7 @@ class HierarchicalMDLMTrainer:
         print(f"  → checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str) -> dict:
-        ckpt = torch.load(path, map_location=self.config.device)
+        ckpt = torch.load(path, map_location=self.config.device, weights_only=False)
         self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
         print(f"Loaded checkpoint from {path} (phase={ckpt['phase']}, step={ckpt['step']})")
         return ckpt
