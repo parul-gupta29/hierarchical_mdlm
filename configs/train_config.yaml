@@ -10,7 +10,7 @@ max_length: 1024           # maximum sequence length
 
 # Noise schedule
 noise_type: "loglinear"
-sampling_eps: 0.001
+sampling_eps: 0.01
 antithetic_sampling: true
 # Per-level noise scales: level 0 (summary) = low noise, level 1 (text) = high noise
 noise_level_scales:
@@ -53,7 +53,7 @@ phase2_min_lr: 1.0e-6              # cosine decay target after warmup
 
 # Memory / mixed-precision
 use_amp: true                         # automatic mixed precision (fp16)
-grad_accum_steps: 4                   # gradient accumulation (effective batch = batch_size × accum)
+grad_accum_steps: 8                   # gradient accumulation (effective batch = batch_size × accum)
 
 # General
 device: "cuda"
