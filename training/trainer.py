@@ -39,6 +39,7 @@ from models.hierarchical_generator import HierarchicalGenerator
 from models.hierarchy_embedding import HierarchyEmbedding
 from noise_schedule import Noise, HierarchicalNoiseSchedule, get_noise_schedule
 from lora.lora import (
+    LoRALinear,
     apply_lora_to_model,
     freeze_non_lora,
     get_trainable_parameters,
@@ -91,7 +92,9 @@ class TrainerConfig:
     phase1_unfreeze_last_n_blocks: int = 4  # unfreeze last N DDiT blocks
 
     # --- phase 2 ---
-    phase2_lr: float = 3e-5
+    phase2_lr: float = 3e-5              # LoRA adapter learning rate
+    phase2_head_lr: float = 1e-4         # output heads + hierarchy embedding LR
+    phase2_backbone_lr: float = 5e-5     # Phase-1-unfrozen backbone blocks LR
     phase2_weight_decay: float = 0.01
     phase2_max_steps: int = 50_000
     phase2_batch_size: int = 4
@@ -281,24 +284,26 @@ class HierarchicalMDLMTrainer:
     ) -> torch.optim.lr_scheduler.LambdaLR | None:
         """Linear warmup then cosine decay to *min_lr*.
 
+        Each parameter group decays from its own base LR toward *min_lr*.
         Returns ``None`` when *warmup_steps* <= 0 (no scheduling).
         """
         if warmup_steps <= 0:
             return None
 
-        base_lr = optimizer.param_groups[0]["lr"]
+        # Snapshot each group's initial lr so the floor is computed correctly
+        base_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
-        def lr_lambda(current_step: int) -> float:
-            # Linear warmup
-            if current_step < warmup_steps:
-                return current_step / max(1, warmup_steps)
-            # Cosine decay from base_lr → min_lr
-            progress = (current_step - warmup_steps) / max(1, max_steps - warmup_steps)
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            # Scale so that lr decays from base_lr to min_lr
-            return max(min_lr / base_lr, cosine_decay)
+        def _make_lambda(base_lr: float):
+            def lr_lambda(current_step: int) -> float:
+                if current_step < warmup_steps:
+                    return current_step / max(1, warmup_steps)
+                progress = (current_step - warmup_steps) / max(1, max_steps - warmup_steps)
+                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return max(min_lr / base_lr, cosine_decay)
+            return lr_lambda
 
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        lambdas = [_make_lambda(blr) for blr in base_lrs]
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambdas)
 
     def _run_phase(
         self,
@@ -355,18 +360,26 @@ class HierarchicalMDLMTrainer:
                     step_time = time.monotonic() - t0
                     accum_loss = 0.0
 
-                    lr = optimizer.param_groups[0]["lr"]
                     if step % self.config.log_every == 0:
-                        print(f"[{phase_name}] step {step}/{max_steps}  "
-                              f"loss={avg_loss:.4f}  lr={lr:.2e}")
-                        wandb.log({
+                        # Build per-group LR info
+                        lr_strs = []
+                        log_dict: dict = {
                             f"{phase_name}/loss": avg_loss,
                             f"{phase_name}/grad_norm": grad_norm,
-                            f"{phase_name}/lr": lr,
                             f"{phase_name}/step_time_s": step_time,
                             f"{phase_name}/epoch": epoch,
                             "global_step": step,
-                        }, step=step)
+                        }
+                        for i, pg in enumerate(optimizer.param_groups):
+                            label = pg.get("label", f"group{i}")
+                            lr_strs.append(f"{label}={pg['lr']:.2e}")
+                            log_dict[f"{phase_name}/lr_{label}"] = pg["lr"]
+                        # Also log first group as plain "lr" for compatibility
+                        log_dict[f"{phase_name}/lr"] = optimizer.param_groups[0]["lr"]
+
+                        print(f"[{phase_name}] step {step}/{max_steps}  "
+                              f"loss={avg_loss:.4f}  lr=[{', '.join(lr_strs)}]")
+                        wandb.log(log_dict, step=step)
 
                     if step % self.config.save_every == 0:
                         self._save_checkpoint(phase_name, step)
@@ -407,7 +420,7 @@ class HierarchicalMDLMTrainer:
         print_trainable_summary(self.model, "Phase 1")
 
         optimizer = torch.optim.AdamW(
-            get_trainable_parameters(self.model),
+            [{"params": get_trainable_parameters(self.model), "label": "all"}],
             lr=self.config.phase1_lr,
             weight_decay=self.config.phase1_weight_decay,
         )
@@ -433,7 +446,16 @@ class HierarchicalMDLMTrainer:
     # ------------------------------------------------------------------
 
     def run_phase2(self, dataloader: DataLoader) -> None:
-        """Add LoRA to backbone; keep output heads + hierarchy embedding fully trainable."""
+        """Add LoRA to backbone; keep output heads + hierarchy embedding fully trainable.
+
+        Phase-1-unfrozen backbone blocks stay trainable (at a lower LR)
+        so the representations learned there are not discarded.  Three
+        parameter groups get independent learning rates:
+
+            1. Output heads + hierarchy embedding  → ``phase2_head_lr``
+            2. Phase-1-unfrozen backbone blocks    → ``phase2_backbone_lr``
+            3. LoRA adapters                       → ``phase2_lr``
+        """
         print("=" * 60)
         print("PHASE 2: Backbone LoRA + full fine-tune output heads")
         print("=" * 60)
@@ -448,21 +470,87 @@ class HierarchicalMDLMTrainer:
         )
         self.model.to(self.config.device)
 
-        # Freeze all original backbone weights, unfreeze LoRA adapters
+        # --- freeze / unfreeze strategy ---
+        # 1. Freeze everything that is not LoRA
         freeze_non_lora(self.model)
+        # 2. Unfreeze LoRA adapters
         unfreeze_all_lora(self.model)
-        # Output heads are randomly initialized — full fine-tune
+        # 3. Keep output heads + hierarchy embedding fully trainable
         for param in self.model.output_heads.parameters():
             param.requires_grad_(True)
-        # Hierarchy embedding stays fully trainable
         for param in self.model.hierarchy_embedding.parameters():
             param.requires_grad_(True)
+        # 4. Keep Phase-1-unfrozen backbone blocks trainable so we don't
+        #    discard the representations learned in Phase 1
+        n_unfreeze = self.config.phase1_unfreeze_last_n_blocks
+        total_blocks = len(self.model.backbone.blocks)
+        unfrozen_block_indices = set(
+            range(total_blocks - n_unfreeze, total_blocks)
+        ) if n_unfreeze > 0 else set()
+        # Collect param ids that belong to LoRALinear internals (frozen
+        # original weight/bias AND lora_A/lora_B) so we skip them when
+        # bulk-unfreezing backbone blocks.
+        lora_internal_ids: set[int] = set()
+        for module in self.model.backbone.modules():
+            if isinstance(module, LoRALinear):
+                lora_internal_ids.add(id(module.weight))
+                if module.bias is not None:
+                    lora_internal_ids.add(id(module.bias))
+                lora_internal_ids.add(id(module.lora_A))
+                lora_internal_ids.add(id(module.lora_B))
+
+        for idx in unfrozen_block_indices:
+            for param in self.model.backbone.blocks[idx].parameters():
+                if id(param) in lora_internal_ids:
+                    continue
+                param.requires_grad_(True)
 
         print_trainable_summary(self.model, "Phase 2")
 
+        # --- differential learning rates ---
+        head_params: list[nn.Parameter] = []
+        backbone_block_params: list[nn.Parameter] = []
+        lora_params: list[nn.Parameter] = []
+
+        # Build a set of param ids for the unfrozen backbone blocks
+        # (excluding LoRA params which we collect separately).
+        unfrozen_block_param_ids: set[int] = set()
+        for idx in unfrozen_block_indices:
+            for name, param in self.model.backbone.blocks[idx].named_parameters():
+                if "lora_A" not in name and "lora_B" not in name:
+                    unfrozen_block_param_ids.add(id(param))
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "lora_A" in name or "lora_B" in name:
+                lora_params.append(param)
+            elif id(param) in unfrozen_block_param_ids:
+                backbone_block_params.append(param)
+            else:
+                head_params.append(param)
+
+        param_groups = [
+            {"params": head_params,
+             "lr": self.config.phase2_head_lr,
+             "label": "heads"},
+            {"params": lora_params,
+             "lr": self.config.phase2_lr,
+             "label": "lora"},
+        ]
+        if backbone_block_params:
+            param_groups.append({
+                "params": backbone_block_params,
+                "lr": self.config.phase2_backbone_lr,
+                "label": "backbone_blocks",
+            })
+
+        for pg in param_groups:
+            n = sum(p.numel() for p in pg["params"])
+            print(f"  param group '{pg['label']}': {n:,} params, lr={pg['lr']:.2e}")
+
         optimizer = torch.optim.AdamW(
-            get_trainable_parameters(self.model),
-            lr=self.config.phase2_lr,
+            param_groups,
             weight_decay=self.config.phase2_weight_decay,
         )
 
