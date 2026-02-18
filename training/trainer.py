@@ -657,6 +657,71 @@ class HierarchicalMDLMTrainer:
         return results
 
     # ------------------------------------------------------------------
+    #  Convenience: evaluate both hierarchical and flat PPL
+    # ------------------------------------------------------------------
+
+    def evaluate(
+        self,
+        dataloader: DataLoader,
+        num_t_samples: int = 1000,
+        log_to_wandb: bool = True,
+    ) -> dict[str, dict[str, float]]:
+        """Compute both hierarchical and flat perplexity and report results.
+
+        Args:
+            dataloader: test-set DataLoader.
+            num_t_samples: timestep grid size for ELBO integration.
+            log_to_wandb: if True, log both result sets to wandb.
+
+        Returns:
+            ``{"hierarchical": {...}, "flat": {...}}`` where each value
+            is the dict returned by :meth:`compute_perplexity`.
+        """
+        print("=" * 60)
+        print("EVALUATION: Hierarchical PPL (per-level noise weights)")
+        print("=" * 60)
+        hier_results = self.compute_perplexity(
+            dataloader, num_t_samples=num_t_samples, flat=False,
+        )
+        print(f"  Hierarchical PPL = {hier_results['ppl']:.2f}  "
+              f"(NLL = {hier_results['nll']:.4f})")
+        for k in range(self.config.num_levels):
+            print(f"    level {k}: PPL = {hier_results[f'ppl_level{k}']:.2f}  "
+                  f"NLL = {hier_results[f'nll_level{k}']:.4f}")
+
+        print()
+        print("=" * 60)
+        print("EVALUATION: Flat PPL (uniform weights, comparable to MDLM)")
+        print("=" * 60)
+        flat_results = self.compute_perplexity(
+            dataloader, num_t_samples=num_t_samples, flat=True,
+        )
+        print(f"  Flat PPL = {flat_results['ppl']:.2f}  "
+              f"(NLL = {flat_results['nll']:.4f})")
+        for k in range(self.config.num_levels):
+            print(f"    level {k}: PPL = {flat_results[f'ppl_level{k}']:.2f}  "
+                  f"NLL = {flat_results[f'nll_level{k}']:.4f}")
+
+        if log_to_wandb:
+            wandb.log({
+                "eval/hier_ppl": hier_results["ppl"],
+                "eval/hier_nll": hier_results["nll"],
+                "eval/flat_ppl": flat_results["ppl"],
+                "eval/flat_nll": flat_results["nll"],
+                **{f"eval/hier_ppl_level{k}": hier_results[f"ppl_level{k}"]
+                   for k in range(self.config.num_levels)},
+                **{f"eval/hier_nll_level{k}": hier_results[f"nll_level{k}"]
+                   for k in range(self.config.num_levels)},
+                **{f"eval/flat_ppl_level{k}": flat_results[f"ppl_level{k}"]
+                   for k in range(self.config.num_levels)},
+                **{f"eval/flat_nll_level{k}": flat_results[f"nll_level{k}"]
+                   for k in range(self.config.num_levels)},
+                "eval/num_tokens": hier_results["num_tokens"],
+            })
+
+        return {"hierarchical": hier_results, "flat": flat_results}
+
+    # ------------------------------------------------------------------
     #  Convenience: run both phases sequentially
     # ------------------------------------------------------------------
 
