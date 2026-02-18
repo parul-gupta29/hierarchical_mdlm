@@ -511,6 +511,22 @@ class HierarchicalMDLMTrainer:
 
     def load_checkpoint(self, path: str) -> dict:
         ckpt = torch.load(path, map_location=self.config.device, weights_only=False)
-        self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        sd = ckpt["model_state_dict"]
+
+        # If the checkpoint contains LoRA keys the model needs LoRA structure
+        # applied before load_state_dict, otherwise those keys are silently
+        # dropped by strict=False (e.g. resuming an interrupted Phase 2 run).
+        has_lora = any("lora_A" in k or "lora_B" in k for k in sd)
+        if has_lora:
+            apply_lora_to_model(
+                self.model.backbone,
+                target_modules=self.config.phase2_lora_target_modules,
+                rank=self.config.lora_rank,
+                alpha=self.config.lora_alpha,
+                dropout=self.config.lora_dropout,
+            )
+            self.model.to(self.config.device)
+
+        self.model.load_state_dict(sd, strict=False)
         print(f"Loaded checkpoint from {path} (phase={ckpt['phase']}, step={ckpt['step']})")
         return ckpt
