@@ -222,7 +222,11 @@ class HierarchicalGenerator(nn.Module):
 
         per_token_loss = -log_p * token_weight                    # (B, L)
 
-        # Mask and average
+        # Mask and average.
+        # Normalize by sequence length (not by number of masked tokens).
+        # Dividing by n_masked breaks the natural ELBO variance cancellation:
+        #   weight(t) × move_chance(t) ≈ constant across all t
+        # so w×CE×n_masked/L is stable, but w×CE×n_masked/n_masked = w×CE spikes
+        # at small t where weight is large. Dividing by L restores stability.
         per_token_loss = per_token_loss * loss_mask
-        num_valid = loss_mask.sum().clamp(min=1.0)
-        return per_token_loss.sum() / num_valid
+        return (per_token_loss.sum(dim=-1) / L).mean()

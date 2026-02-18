@@ -10,7 +10,7 @@ max_length: 1024           # maximum sequence length
 
 # Noise schedule
 noise_type: "loglinear"
-sampling_eps: 0.001
+sampling_eps: 0.01
 antithetic_sampling: true
 # Per-level noise scales: level 0 (summary) = low noise, level 1 (text) = high noise
 noise_level_scales:
@@ -42,6 +42,7 @@ phase2_lora_target_modules:
   - ".*\\.attn_out$"            # DDiT attention output
   - ".*\\.mlp\\.0$"             # DDiT MLP first linear
   - ".*\\.mlp\\.2$"             # DDiT MLP second linear
+  - ".*\\.adaLN_modulation$"    # DDiT adaptive layer norm (conditioning pathway)
 phase2_lr: 3.0e-5
 phase2_weight_decay: 0.01
 phase2_max_steps: 50000
@@ -52,7 +53,7 @@ phase2_min_lr: 1.0e-6              # cosine decay target after warmup
 
 # Memory / mixed-precision
 use_amp: true                         # automatic mixed precision (fp16)
-grad_accum_steps: 4                   # gradient accumulation (effective batch = batch_size × accum)
+grad_accum_steps: 8                   # gradient accumulation (effective batch = batch_size × accum)
 
 # General
 device: "cuda"
