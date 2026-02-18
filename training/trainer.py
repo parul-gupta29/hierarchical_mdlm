@@ -483,6 +483,179 @@ class HierarchicalMDLMTrainer:
         )
 
     # ------------------------------------------------------------------
+    #  Test-set perplexity evaluation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def compute_perplexity(
+        self,
+        dataloader: DataLoader,
+        num_t_samples: int = 1000,
+        flat: bool = False,
+    ) -> dict[str, float]:
+        """Compute test-set perplexity via Monte Carlo ELBO integration.
+
+        Estimates the negative log-likelihood upper bound by averaging the
+        ELBO loss over a uniform grid of timesteps, then exponentiates.
+
+        Args:
+            dataloader: test-set DataLoader (should NOT shuffle or drop_last).
+            num_t_samples: number of timesteps in the uniform grid [eps, 1].
+                More samples → tighter estimate, but linearly more compute.
+            flat: if True, use uniform noise scales (1.0 for all levels)
+                instead of the per-level scales.  This makes the result
+                directly comparable to standard (non-hierarchical) MDLM.
+
+        Returns:
+            Dict with keys:
+                ``"ppl"``       — overall perplexity (exp of mean NLL)
+                ``"nll"``       — mean NLL per token
+                ``"ppl_level0"``— perplexity on level-0 (summary) tokens only
+                ``"ppl_level1"``— perplexity on level-1 (text) tokens only
+                ``"nll_level0"``— NLL on level-0 tokens
+                ``"nll_level1"``— NLL on level-1 tokens
+                ``"num_tokens"``— total valid tokens evaluated
+        """
+        device = self.config.device
+        eps = self.config.sampling_eps
+        K = self.config.num_levels
+
+        self.model.eval()
+
+        # Build the noise schedule for evaluation
+        if flat:
+            flat_noise = HierarchicalNoiseSchedule(
+                base_noise=self.hier_noise.base_noise,
+                level_scales=[1.0] * K,
+            )
+            flat_noise.to(device)
+            eval_noise = flat_noise
+        else:
+            eval_noise = self.hier_noise
+
+        # Uniform timestep grid
+        t_grid = torch.linspace(eps, 1.0, num_t_samples, device=device)
+
+        # Accumulators: total weighted NLL and token counts
+        total_nll = 0.0
+        total_tokens = 0
+        per_level_nll = [0.0] * K
+        per_level_tokens = [0] * K
+
+        num_batches = 0
+        for batch in dataloader:
+            x0 = batch["input_ids"].to(device)
+            hierarchy_labels = batch["hierarchy_labels"].to(device)
+            title_mask = batch["title_mask"].to(device)
+            attn_mask = batch["attention_mask"].to(device)
+            B, L = x0.shape
+
+            # Valid tokens: non-pad and non-title
+            valid_mask = attn_mask * (1.0 - title_mask)  # (B, L)
+
+            # Per-level valid masks
+            level_masks = []
+            for k in range(K):
+                lm = valid_mask * (hierarchy_labels == k).float()
+                level_masks.append(lm)
+
+            # Accumulate ELBO across timestep grid
+            batch_nll_sum = 0.0
+            batch_level_nll = [0.0] * K
+
+            for t_scalar in t_grid:
+                t = t_scalar.expand(B)
+                sigma, dsigma = eval_noise(t)
+
+                per_level_mc = eval_noise.get_per_level_move_chance(sigma)
+                xt = self._q_xt_per_level(
+                    x0, hierarchy_labels, per_level_mc, title_mask,
+                )
+
+                hier_probs = HierarchyEmbedding.labels_to_onehot(
+                    hierarchy_labels, K,
+                )
+
+                with torch.amp.autocast("cuda", enabled=self.config.use_amp):
+                    logits_per_level = self.model(xt, sigma, hier_probs)
+
+                per_level_weight = eval_noise.get_per_level_loss_weight(
+                    sigma, dsigma,
+                )
+
+                # --- per-token NLL (without reducing to scalar) ---
+                x0_idx = x0.unsqueeze(-1)
+                is_masked = (xt == self.mask_index)
+                V = logits_per_level[0].shape[-1]
+                mask_bias = logits_per_level[0].new_zeros(V)
+                mask_bias[self.mask_index] = self.model.NEG_INF
+
+                log_probs_list = []
+                for logits in logits_per_level:
+                    logit_at_x0 = torch.gather(
+                        logits, dim=-1, index=x0_idx,
+                    ).squeeze(-1)
+                    lse = torch.logsumexp(logits + mask_bias, dim=-1)
+                    lp = torch.where(
+                        is_masked,
+                        logit_at_x0 - lse,
+                        torch.zeros_like(lse),
+                    )
+                    log_probs_list.append(lp)
+
+                log_probs_at_x0 = torch.stack(log_probs_list, dim=-1)
+                level_idx = hierarchy_labels.unsqueeze(-1).long()
+                log_p = torch.gather(
+                    log_probs_at_x0, dim=-1, index=level_idx,
+                ).squeeze(-1)
+
+                token_weight = torch.gather(
+                    per_level_weight, dim=1, index=hierarchy_labels.long(),
+                )
+
+                per_token_nll = -log_p * token_weight  # (B, L)
+
+                # Overall
+                batch_nll_sum += (per_token_nll * valid_mask).sum().item()
+
+                # Per-level
+                for k in range(K):
+                    batch_level_nll[k] += (
+                        per_token_nll * level_masks[k]
+                    ).sum().item()
+
+            # Average over timestep grid, accumulate
+            n_valid = valid_mask.sum().item()
+            total_nll += batch_nll_sum / num_t_samples
+            total_tokens += n_valid
+
+            for k in range(K):
+                n_k = level_masks[k].sum().item()
+                per_level_nll[k] += batch_level_nll[k] / num_t_samples
+                per_level_tokens[k] += n_k
+
+            num_batches += 1
+            if num_batches % 10 == 0:
+                running_nll = total_nll / max(total_tokens, 1)
+                print(f"  [eval] {num_batches} batches | "
+                      f"running NLL={running_nll:.4f}  "
+                      f"PPL={math.exp(running_nll):.2f}")
+
+        # Final metrics
+        avg_nll = total_nll / max(total_tokens, 1)
+        results = {
+            "ppl": math.exp(avg_nll),
+            "nll": avg_nll,
+            "num_tokens": total_tokens,
+        }
+        for k in range(K):
+            nll_k = per_level_nll[k] / max(per_level_tokens[k], 1)
+            results[f"nll_level{k}"] = nll_k
+            results[f"ppl_level{k}"] = math.exp(nll_k)
+
+        return results
+
+    # ------------------------------------------------------------------
     #  Convenience: run both phases sequentially
     # ------------------------------------------------------------------
 
