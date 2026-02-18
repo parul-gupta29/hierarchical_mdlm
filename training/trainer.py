@@ -78,6 +78,7 @@ class TrainerConfig:
         r".*\.attn_out$",
         r".*\.mlp\.0$",
         r".*\.mlp\.2$",
+        r".*\.adaLN_modulation$",   # adaptive layer norm (conditioning pathway)
     ])
 
     # --- phase 1 ---
